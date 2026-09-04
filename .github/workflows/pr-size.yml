@@ -16,7 +16,7 @@ jobs:
       pull-requests: write
     steps:
       - name: Classify diff size and comment
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         continue-on-error: true
         with:
           script: |
