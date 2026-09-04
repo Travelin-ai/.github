@@ -1,0 +1,150 @@
+name: PR size (reusable)
+
+# Reusable workflow — see README.md for the caller snippet repos use to
+# opt in. Warn-only: it comments and labels, it never fails the run.
+#
+# Runs for draft PRs too (no draft guard) on purpose — size should be
+# visible before a PR is un-drafted, not discovered after.
+
+on:
+  workflow_call:
+
+jobs:
+  size:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Classify diff size and comment
+        uses: actions/github-script@v7
+        continue-on-error: true
+        with:
+          script: |
+            const SOURCE_BUDGET = 600;
+            const TOTAL_BUDGET = 1500;
+            const MARKER = '<!-- pr-size -->';
+            const LABEL = 'size:over-budget';
+
+            // Warn-only by contract: an API hiccup must never turn this check red.
+            try {
+              const { owner, repo } = context.repo;
+              const pr = context.payload.pull_request;
+              const pull_number = pr.number;
+
+              const files = await github.paginate(github.rest.pulls.listFiles, {
+                owner, repo, pull_number,
+              });
+
+              const buckets = { snapshots: 0, generated: 0, tests: 0, docs: 0, source: 0 };
+              const GENERATED_BASENAMES = new Set([
+                'graphqlTypes.d.ts', 'package-lock.json', 'yarn.lock', 'pnpm-lock.yaml',
+              ]);
+
+              for (const f of files) {
+                const filename = f.filename;
+                const base = filename.split('/').pop();
+                const lines = f.additions + f.deletions;
+
+                let bucket;
+                if (filename.includes('__snapshots__/') || filename.endsWith('.snap')) {
+                  bucket = 'snapshots';
+                } else if (GENERATED_BASENAMES.has(base)) {
+                  bucket = 'generated';
+                } else if (
+                  filename.includes('__tests__/') ||
+                  filename.includes('/test/') ||
+                  filename.includes('/tests/') ||
+                  base.includes('.test.') ||
+                  base.includes('.spec.')
+                ) {
+                  bucket = 'tests';
+                } else if (filename.endsWith('.md') || filename.includes('/docs/')) {
+                  bucket = 'docs';
+                } else {
+                  bucket = 'source';
+                }
+                buckets[bucket] += lines;
+              }
+
+              const total = Object.values(buckets).reduce((a, b) => a + b, 0);
+              const overBudget = buckets.source > SOURCE_BUDGET || total > TOTAL_BUDGET;
+
+              const defaultBranch = context.payload.repository.default_branch;
+              const baseRef = pr.base.ref;
+              let staleBaseNote = '';
+              if (baseRef !== defaultBranch) {
+                staleBaseNote =
+                  `\n\nThis PR is stacked on \`${baseRef}\`, not \`${defaultBranch}\`. ` +
+                  `If \`${baseRef}\` has been pushed since this PR was opened, the counts ` +
+                  `above may include its commits too — GitHub pins the base SHA at PR ` +
+                  `creation. Force a recount with:\n\n` +
+                  '```\n' +
+                  `gh pr edit ${pull_number} --base ${defaultBranch} && gh pr edit ${pull_number} --base ${baseRef}\n` +
+                  '```';
+              }
+
+              const heading = overBudget
+                ? '### PR size: over budget'
+                : '### PR size: within budget';
+              const table =
+                '| Bucket | Lines (add + del) |\n' +
+                '| --- | --- |\n' +
+                `| snapshots | ${buckets.snapshots} |\n` +
+                `| generated | ${buckets.generated} |\n` +
+                `| tests | ${buckets.tests} |\n` +
+                `| docs | ${buckets.docs} |\n` +
+                `| source | ${buckets.source} |\n` +
+                `| **Total** | **${total}** |`;
+              const budgetLine =
+                `Budget: ~${SOURCE_BUDGET} source lines / ~${TOTAL_BUDGET} total lines — ` +
+                'see [PR conventions](https://github.com/Travelin-ai/.github/blob/main/PR_CONVENTIONS.md).';
+              const body = `${MARKER}\n${heading}\n\n${table}\n\n${budgetLine}${staleBaseNote}`;
+
+              const comments = await github.paginate(github.rest.issues.listComments, {
+                owner, repo, issue_number: pull_number,
+              });
+              const existing = comments.find(
+                (c) => c.body && c.body.split('\n')[0].trim() === MARKER
+              );
+
+              if (overBudget) {
+                if (existing) {
+                  await github.rest.issues.updateComment({
+                    owner, repo, comment_id: existing.id, body,
+                  });
+                } else {
+                  await github.rest.issues.createComment({
+                    owner, repo, issue_number: pull_number, body,
+                  });
+                }
+
+                try {
+                  await github.rest.issues.createLabel({
+                    owner, repo, name: LABEL, color: 'D93F0B',
+                    description: 'PR exceeds the ~600 source / ~1,500 total line budget; consider splitting',
+                  });
+                } catch (e) {
+                  if (e.status !== 422) throw e; // 422 = label already exists
+                }
+                await github.rest.issues.addLabels({
+                  owner, repo, issue_number: pull_number, labels: [LABEL],
+                });
+              } else {
+                try {
+                  await github.rest.issues.removeLabel({
+                    owner, repo, issue_number: pull_number, name: LABEL,
+                  });
+                } catch (e) {
+                  if (e.status !== 404) throw e; // 404 = label wasn't on the PR
+                }
+
+                if (existing) {
+                  await github.rest.issues.updateComment({
+                    owner, repo, comment_id: existing.id, body,
+                  });
+                }
+                // no prior comment and within budget: post nothing
+              }
+            } catch (err) {
+              core.warning(`pr-size: unexpected error, skipping (${err && err.message ? err.message : err})`);
+            }
