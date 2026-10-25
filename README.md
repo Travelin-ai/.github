@@ -16,12 +16,17 @@ repo opts in with a caller workflow like:
 name: PR size
 on:
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
+    types: [opened, reopened, ready_for_review]
 permissions:
   pull-requests: write
 jobs:
   size:
     uses: Travelin-ai/.github/.github/workflows/pr-size.yml@main
 ```
+
+Not on `synchronize`: every run is billed a full minute, so the size is
+counted when the PR opens and again when a draft is marked ready, not on
+every push. The check is warn-only, so a stale label between pushes costs
+nothing.
 
 The `trav` Claude Code plugin carries a mirror of `PR_CONVENTIONS.md`; change this file first, then the mirror.
